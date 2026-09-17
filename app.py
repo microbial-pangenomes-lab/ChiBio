@@ -19,13 +19,65 @@ import copy
 import csv
 import smbus2 as smbus
 
-
 application = Flask(__name__)
 application.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0 #Try this https://stackoverflow.com/questions/23112316/using-flask-how-do-i-modify-the-cache-control-header-for-all-output/23115561#23115561
+
+import logging
+gunicorn_logger = logging.getLogger('gunicorn.error')
+application.logger.handlers = gunicorn_logger.handlers
+application.logger.setLevel(gunicorn_logger.level)
 
 lock=Lock()
         
 #Initialise data structures.
+
+# change made by Marco on 14.08.2024
+#CHEMOSTAT=60 # minutes
+# change made by Marco on 05.02.2025
+CHEMOSTAT_TIME_RATE={
+  'M0': 120,
+  'M1': 120,
+  'M2': 120,
+  'M3': 120,
+
+  # How many minutes between dilutions
+  # NOTE: these values are in minutes
+
+  'M4': 120,
+  'M5': 120,
+  'M6': 120,
+  'M7': 120,
+}
+CHEMOSTAT_START={
+  'M0': 2,
+  'M1': 2,
+  'M2': 2,
+  'M3': 2,
+
+  # The earliest time to start the chemostat
+  # NOTE: these values are in hours
+
+  'M4': 2,
+  'M5': 2,
+  'M6': 2,
+  'M7': 2,
+}
+CHEMOSTAT_PUMP_RATE={
+  'M0': 0.0045,
+  'M1': 0.0043,
+  'M2': 0.0045,
+  'M3': 0.0048,
+
+  # Actual dilution rate for pump 1
+
+  'M4': 0.005,
+  'M5': 0.0046,
+  'M6': 0.0048,
+  'M7': 0.0048,
+}
+# change made by Marco on 06.05.2025
+OD_TARGET=1.5
+DELTA_OD_THRESHOLD=0.1
 
 #Sysdata is a structure created for each device and contains the setup / measured data related to that device during an experiment. All of this information is passed into the user interface during an experiment.
 sysData = {'M0' : {
@@ -68,9 +120,9 @@ sysData = {'M0' : {
    'Stir' :  {'target' : 0.0,'default' : 0.5,'max': 1.0, 'min' : 0.0, 'ON' : 0},
    'Light' :  {'target' : 0.0,'default' : 0.5,'max': 1.0, 'min' : 0.0, 'ON' : 0, 'Excite' : 'LEDD', 'record' : []},
    'Custom' :  {'Status' : 0.0,'default' : 0.0,'Program': 'C1', 'ON' : 0,'param1' : 0, 'param2' : 0, 'param3' : 0.0, 'record' : []},
-   'FP1' : {'ON' : 0 ,'LED' : 0,'BaseBand' : 0, 'Emit1Band' : 0,'Emit2Band' : 0,'Base' : 0, 'Emit1' : 0,'Emit2' : 0,'BaseRecord' : 0, 'Emit1Record' : 0,'Emit2Record' : 0 ,'Gain' : 0},
-   'FP2' : {'ON' : 0 ,'LED' : 0,'BaseBand' : 0, 'Emit1Band' : 0,'Emit2Band' : 0,'Base' : 0, 'Emit1' : 0,'Emit2' : 0,'BaseRecord' : 0, 'Emit1Record' : 0,'Emit2Record' : 0 ,'Gain' : 0},
-   'FP3' : {'ON' : 0 ,'LED' : 0,'BaseBand' : 0, 'Emit1Band' : 0,'Emit2Band' : 0,'Base' : 0, 'Emit1' : 0,'Emit2' : 0,'BaseRecord' : 0, 'Emit1Record' : 0,'Emit2Record' : 0 ,'Gain' : 0},
+   'FP1' : {'ON' : 0 ,'LED' : 0,'BaseBand' : 0, 'Emit11Band' : 0,'Emit2Band' : 0,'Base' : 0, 'Emit11' : 0,'Emit2' : 0,'BaseRecord' : 0, 'Emit1Record' : 0,'Emit2Record' : 0 ,'Gain' : 0},
+   'FP2' : {'ON' : 0 ,'LED' : 0,'BaseBand' : 0, 'Emit11Band' : 0,'Emit2Band' : 0,'Base' : 0, 'Emit11' : 0,'Emit2' : 0,'BaseRecord' : 0, 'Emit1Record' : 0,'Emit2Record' : 0 ,'Gain' : 0},
+   'FP3' : {'ON' : 0 ,'LED' : 0,'BaseBand' : 0, 'Emit11Band' : 0,'Emit2Band' : 0,'Base' : 0, 'Emit11' : 0,'Emit2' : 0,'BaseRecord' : 0, 'Emit1Record' : 0,'Emit2Record' : 0 ,'Gain' : 0},
    'biofilm' : {'LEDA' : {'nm410' : 0, 'nm440' : 0, 'nm470' : 0, 'nm510' : 0, 'nm550' : 0, 'nm583' : 0, 'nm620' : 0, 'nm670' : 0,'CLEAR' : 0,'NIR' : 0},
                 'LEDB' : {'nm410' : 0, 'nm440' : 0, 'nm470' : 0, 'nm510' : 0, 'nm550' : 0, 'nm583' : 0, 'nm620' : 0, 'nm670' : 0,'CLEAR' : 0,'NIR' : 0},
                 'LEDC' : {'nm410' : 0, 'nm440' : 0, 'nm470' : 0, 'nm510' : 0, 'nm550' : 0, 'nm583' : 0, 'nm620' : 0, 'nm670' : 0,'CLEAR' : 0,'NIR' : 0},
@@ -189,7 +241,7 @@ def toggleWatchdog():
 
 
 GPIO.setup(sysItems['Watchdog']['pin'], GPIO.OUT)
-print(str(datetime.now()) + ' Starting watchdog')
+application.logger.info(' Starting watchdog')
 sysItems['Watchdog']['thread']=Thread(target = runWatchdog, args=())
 sysItems['Watchdog']['thread'].setDaemon(True)
 sysItems['Watchdog']['thread'].start(); 
@@ -372,7 +424,7 @@ def initialise(M):
     # while (1==1):
     #     i=i+1
     #     if (i%1000==1):
-    #         print(str(i))
+    #         application.logger.debug(str(i))
     #     sysDevices[M]['ThermometerInternal']['device'].readU8(int(0x05))
     # getData=I2CCom(M,which,1,16,0x05,0,0)
     
@@ -380,7 +432,7 @@ def initialise(M):
     scanDevices(M)
     if(sysData[M]['present']==1):
         turnEverythingOff(M)
-        print(str(datetime.now()) + " Initialised " + str(M) +', Device ID: ' + sysData[M]['DeviceID'])
+        application.logger.info(" Initialised " + str(M) +', Device ID: ' + sysData[M]['DeviceID'])
 
     
     
@@ -390,9 +442,10 @@ def initialiseAll():
     sysItems['Multiplexer']['device']=I2C.get_i2c_device(0x74,2) 
     sysItems['FailCount']=0
     time.sleep(2.0) #This wait is to allow the watchdog circuit to boot.
-    print(str(datetime.now()) + ' Initialising devices')
+    application.logger.info(' Initialising devices')
 
-    for M in ['M0','M1','M2','M3','M4','M5','M6','M7']:
+    for M in ['M0','M1','M2','M3',
+              'M4','M5','M6','M7']:
         initialise(M)
     scanDevices("all")
     
@@ -564,7 +617,7 @@ def SetOutputTarget(M,item, value):
     M=str(M)
     if (M=="0"):
         M=sysItems['UIDevice']
-    print(str(datetime.now()) + " Set item: " + str(item) + " to value " + str(value) + " on " + str(M))
+    application.logger.debug(" Set item: " + str(item) + " to value " + str(value) + " on " + str(M))
     if (value<sysData[M][item]['min']):
         value=sysData[M][item]['min']
     if (value>sysData[M][item]['max']):
@@ -709,8 +762,10 @@ def PumpModulation(M,item):
         return
     
     Time1=datetime.now()
-    cycletime=sysData[M]['Experiment']['cycleTime']*1.05 #We make this marginally longer than the experiment cycle time to avoid too much chaos when you come back around to pumping again.
-    
+    #cycletime=sysData[M]['Experiment']['cycleTime']*1.05 #We make this marginally longer than the experiment cycle time to avoid too much chaos when you come back around to pumping again.
+    #cycletime=sysData[M]['Experiment']['cycleTime']*12*1.005 # change made by Marco on 16.02.2023
+    cycletime=sysData[M]['Experiment']['cycleTime']*1.05 # change made by Marco on 14.08.2024
+
     Ontime=cycletime*abs(sysData[M][item]['target'])
     
     # Decided to remove the below section in order to prevent media buildup in the device if you are pumping in very rapidly. This check means that media is removed, then added. Removing this code means these happen simultaneously.
@@ -744,6 +799,8 @@ def PumpModulation(M,item):
     elapsedTime=Time2-Time1
     elapsedTimeSeconds=round(elapsedTime.total_seconds(),2)
     Offtime=cycletime-elapsedTimeSeconds
+    #Offtime=(cycletime*CHEMOSTAT)-elapsedTimeSeconds # change made by Marco on 14.08.2024
+    #Offtime=(cycletime*CHEMOSTAT[M])-elapsedTimeSeconds # change made by Marco on 05.02.2025
     if (Offtime>0.0):
         time.sleep(Offtime)   
     
@@ -916,8 +973,8 @@ def AS7341Read(M,Gain,ISteps,reset):
     I2CCom(M,'AS7341',0,8,int(0x80),int(0x01),0)  #Stops spectral measurement, leaves power on.
 
     #Status2=int(I2CCom(M,'AS7341',1,8,0xA3,0x00,0)) #Reads system status at end of spectral measursement. 
-    #print(str(ASTATUS))
-    #print(str(Status2))
+    #application.logger.debug(str(ASTATUS))
+    #application.logger.debug(str(Status2))
 
     sysData[M]['AS7341']['current']['ADC0']=int(bin(C0_H)[2:].zfill(8)+bin(C0_L)[2:].zfill(8),2)
     sysData[M]['AS7341']['current']['ADC1']=int(bin(C1_H)[2:].zfill(8)+bin(C1_L)[2:].zfill(8),2)
@@ -928,7 +985,7 @@ def AS7341Read(M,Gain,ISteps,reset):
     
     
     if (sysData[M]['AS7341']['current']['ADC0']==65535 or sysData[M]['AS7341']['current']['ADC1']==65535 or sysData[M]['AS7341']['current']['ADC2']==65535 or sysData[M]['AS7341']['current']['ADC3']==65535 or sysData[M]['AS7341']['current']['ADC4']==65535 or sysData[M]['AS7341']['current']['ADC5']==65535 ):
-        print(str(datetime.now()) + ' Spectrometer measurement was saturated on device ' + str(M)) #Not sure if this saturation check above actually works correctly...
+        application.logger.info(' Spectrometer measurement was saturated on device ' + str(M)) #Not sure if this saturation check above actually works correctly...
     return 0
         
 
@@ -1007,10 +1064,10 @@ def GetLight(M,wavelengths,Gain,ISteps):
             AS7341Read(M,Gain,ISteps,success) 
             success=2
         except:
-            print(str(datetime.now()) + 'AS7341 measurement failed on ' + str(M))
+            application.logger.warning('AS7341 measurement failed on ' + str(M))
             success=success+1
             if success==2:
-                print(str(datetime.now()) + 'AS7341 measurement failed twice on ' + str(M) + ', setting unity values')
+                application.logger.warning('AS7341 measurement failed twice on ' + str(M) + ', setting unity values')
                 sysData[M]['AS7341']['current']['ADC0']=1
                 DACS=['ADC1', 'ADC2', 'ADC3', 'ADC4', 'ADC5']
                 for DAC in DACS:
@@ -1067,47 +1124,111 @@ def CustomProgram(M):
     #Subsequent few lines reads in external parameters from a file if you are using any.
     fname='InputParameters_' + str(M)+'.csv'
 	
-    with open(fname, 'rb') as f:
-        reader = csv.reader(f)
-        listin = list(reader)
-    Params=listin[0]
+    try:
+        with open(fname, 'rb') as f:
+            reader = csv.reader(f)
+            listin = list(reader)
+        Params=listin[0]
+    except FileNotFoundError:
+        #application.logger.warning('Input parameters file not found for device ' + str(M) + ', using empty parameters')
+        Params=[]
     addTerminal(M,'Running Program = ' + str(program) + ' on device ' + str(M))
-	
+    #application.logger.info('Running Program = ' + str(program) + ' on device ' + str(M))
 	
     if (program=="C1"): #Optogenetic Integral Control Program
-        integral=0.0 #Integral in integral controller
-        green=0.0 #Intensity of Green actuation 
-        red=0.0 #Intensity of red actuation.
-        GFPNow=sysData[M]['FP1']['Emit1']
-        GFPTarget=sysData[M]['Custom']['Status'] #This is the controller setpoint.
-        error=GFPTarget-GFPNow
-        if error>0.0075:
-            green=1.0
-            red=0.0
-            sysData[M]['Custom']['param3']=0.0 
-        elif error<-0.0075:
-            green=0.0
-            red=1.0
-            sysData[M]['Custom']['param3']=0.0
+        # first, check how far are we from the target OD
+        # so that we know if we should be running the turbidostat
+        current_od = sysData[M]['OD']['current']
+        delta_od = OD_TARGET - current_od
+
+        if delta_od < DELTA_OD_THRESHOLD:
+            RegulateOD(M, OD_TARGET)
         else:
-            red=1.0
-            balance=float(Params[0]) #our guess at green light level to get 50% expression.
-            KI=float(Params[1])
-            KP=float(Params[2])
-            integral=sysData[M]['Custom']['param3']+error*KI
-            green=balance+KP*error+integral
-            sysData[M]['Custom']['param3']=integral
+            # second, let's check how much time has passed
+            # in order to see if we should be running a chemostat dilution
+            if len(sysData[M]['time']['record']) > 0:
+                elapsed_time = sysData[M]['time']['record'][-1] / 60.0
+            else:
+                elapsed_time = 0.0
+
+            # third, check when the chemostat is supposed to start
+            chemostat_start_time = CHEMOSTAT_START[M]
+            b_dilution = False
+            if elapsed_time / 60.0 > chemostat_start_time:
+                # now, check if enough time has passed since last dilution
+                if len(sysData[M]['Custom']['record']) == 0:
+                    # this is the first one
+                    b_dilution = True
+                    sysData[M]['Custom']['record'].append(elapsed_time)
+                    application.logger.info('First chemostat dilution ('+ str(M) + ' at time ' + str(elapsed_time) + ')')
+                else:
+                    last_dilution_time = sysData[M]['Custom']['record'][-1]
+                    if elapsed_time - last_dilution_time > CHEMOSTAT_TIME_RATE[M]:
+                        b_dilution = True
+                        sysData[M]['Custom']['record'].append(elapsed_time)
+                        application.logger.info('Chemostat dilution ('+ str(M) + ' at time ' + str(elapsed_time) + ')')
+
+            # run the dilution if needed
+            if b_dilution:
+                Pump1 = CHEMOSTAT_PUMP_RATE[M]
+                Pump2 = 1.0
+                application.logger.info('Running chemostat dilution ('+ str(M) + ' with rate ' + str(Pump1) + ')')
+            else:
+                Pump1 = 0.0
+                Pump2 = 0.0
+
+            Pump1Direction=sysData[M]['Pump1']['direction']
+            Pump2Direction=sysData[M]['Pump2']['direction']
+
+            #Make sure values are in appropriate range. We want to limit the maximum size of pump1 to prevent it from overflowing.
+            if(Pump1>0.02):
+                Pump1=0.02
+            elif(Pump1<0):
+                Pump1=0.0
+
+            #Set new Pump targets
+            sysData[M]['Pump1']['target']=Pump1*Pump1Direction
+            sysData[M]['Pump2']['target']=Pump2*0.25*Pump2Direction
+
+            SetOutputOn(M,'Pump1',1)
+            SetOutputOn(M,'Pump2',1)
+
+
+        #application.logger.info('Entered code section for program C1')
+        # change made by Marco on 06.05.2025
+        #integral=0.0 #Integral in integral controller
+        #green=0.0 #Intensity of Green actuation 
+        #red=0.0 #Intensity of red actuation.
+        #GFPNow=sysData[M]['FP1']['Emit1']
+        #GFPTarget=sysData[M]['Custom']['Status'] #This is the controller setpoint.
+        #error=GFPTarget-GFPNow
+        #if error>0.0075:
+        #   green=1.0
+        #    red=0.0
+        #    sysData[M]['Custom']['param3']=0.0 
+        #elif error<-0.0075:
+        #    green=0.0
+        #    red=1.0
+        #    sysData[M]['Custom']['param3']=0.0
+        #else:
+        #    red=1.0
+        #    balance=float(Params[0]) #our guess at green light level to get 50% expression.
+        #    KI=float(Params[1])
+        #    KP=float(Params[2])
+        #    integral=sysData[M]['Custom']['param3']+error*KI
+        #    green=balance+KP*error+integral
+        #    sysData[M]['Custom']['param3']=integral
         
 
-        GreenThread=Thread(target = CustomLEDCycle, args=(M,'LEDD',green))
-        GreenThread.setDaemon(True)
-        GreenThread.start();
-        RedThread=Thread(target = CustomLEDCycle, args=(M,'LEDF',red))
-        RedThread.setDaemon(True)
-        RedThread.start();
-        sysData[M]['Custom']['param1']=green
-        sysData[M]['Custom']['param2']=red
-        addTerminal(M,'Program = ' + str(program) + ' green= ' + str(green)+ ' red= ' + str(red) + ' integral= ' + str(integral))
+        #GreenThread=Thread(target = CustomLEDCycle, args=(M,'LEDD',green))
+        #GreenThread.setDaemon(True)
+        #GreenThread.start();
+        #RedThread=Thread(target = CustomLEDCycle, args=(M,'LEDF',red))
+        #RedThread.setDaemon(True)
+        #RedThread.start();
+        #sysData[M]['Custom']['param1']=green
+        #sysData[M]['Custom']['param2']=red
+        #addTerminal(M,'Program = ' + str(program) + ' green= ' + str(green)+ ' red= ' + str(red) + ' integral= ' + str(integral))
 	
     elif (program=="C2"): #UV Integral Control Program
         integral=0.0 #Integral in integral controller
@@ -1179,7 +1300,7 @@ def CustomProgram(M):
             iters=(timept//timelength)
             Dose0=float(Params[0])
             Dose=Dose0*(2.0**float(iters)) #UV Dose, in terms of amount of time UV shoudl be left on at 1.0 intensity.
-            print(str(datetime.now()) + ' Gave dose ' + str(Dose) + " at iteration " + str(iters) + " on device " + str(M))
+            application.logger.info(' Gave dose ' + str(Dose) + " at iteration " + str(iters) + " on device " + str(M))
             
             if (Dose<30.0):  
                 powerlvl=Dose/30.0
@@ -1207,7 +1328,7 @@ def CustomProgram(M):
                 
             Dose0=float(Params[0])
             Dose=Dose0*(2.0**float(iters)) #UV Dose, in terms of amount of time UV shoudl be left on at 1.0 intensity.
-            print(str(datetime.now()) + ' Gave dose ' + str(Dose) + " at iteration " + str(iters) + " on device " + str(M))
+            application.logger.info(' Gave dose ' + str(Dose) + " at iteration " + str(iters) + " on device " + str(M))
               
             if (Dose<30.0):  
                 powerlvl=Dose/30.0
@@ -1248,7 +1369,6 @@ def SetLightActuation(Excite):
     item="Light"
     if sysData[M][item]['ON']==1:
         sysData[M][item]['ON']=0
-        SetOutputOn(M,sysData[M][item]['Excite'],0) #In case the current LED is on we need to make sure it turns off
         return ('', 204)
     else:
         sysData[M][item]['Excite']=str(Excite)
@@ -1286,7 +1406,7 @@ def CharacteriseDevice(M,Program):
 def CharacteriseDevice2(M):
     global sysData
     global sysItems
-    print('In1')
+    application.logger.debug('In1')
     M=str(M)
     if (M=="0"):
         M=sysItems['UIDevice']
@@ -1302,7 +1422,7 @@ def CharacteriseDevice2(M):
         }
         
         
-    print('Got in!')   
+    application.logger.debug('Got in!')   
     bands=['nm410' ,'nm440','nm470','nm510','nm550','nm583','nm620','nm670','CLEAR']    
     powerlevels=[0,0.01,0.02,0.03,0.04,0.05,0.06,0.07,0.08,0.09,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0]
     items= ['LEDA','LEDB','LEDC','LEDD','LEDE','LEDF','LEDG','LASER650']
@@ -1315,7 +1435,7 @@ def CharacteriseDevice2(M):
             SetOutputOn(M,item,1)
             GetSpectrum(M,gains[gi])
             SetOutputOn(M,item,0)
-            print(item + ' ' + str(power))
+            application.logger.debug(item + ' ' + str(power))
             for band in bands:
                 result[item][band].append(int(sysData[M]['AS7341']['spectrum'][band]))
             addTerminal(M,'Measured Item = ' + str(item) + ' at power ' + str(power))
@@ -1347,7 +1467,7 @@ def I2CCom(M,device,rw,hl,data1,data2,SMBUSFLAG):
     
     global sysDevices
     if(sysData[M]['present']==0): #Something stupid has happened in software if this is the case!
-        print(str(datetime.now()) + ' Trying to communicate with absent device - bug in software!. Disabling hardware and software!')
+        application.logger.critical(' Trying to communicate with absent device - bug in software!. Disabling hardware and software!')
         sysItems['Watchdog']['ON']=0 #Basically this will crash all the electronics and the software. 
         out=0
         tries=-1
@@ -1369,29 +1489,30 @@ def I2CCom(M,device,rw,hl,data1,data2,SMBUSFLAG):
             else:
                 tries=tries+1
                 time.sleep(0.02)
-                print(str(datetime.now()) + ' Multiplexer didnt switch ' + str(tries) + " times on " + str(M))
-        except: #If there is an error in the above.
+                application.logger.warning(' Multiplexer didnt switch ' + str(tries) + " times on " + str(M))
+        except Exception as e: #If there is an error in the above.
             tries=tries+1
             time.sleep(0.02)
-            print(str(datetime.now()) + ' Failed Multiplexer Comms ' + str(tries) + " times")
+            application.logger.warning(' Failed Multiplexer Comms ' + str(tries) + " times")
+            application.logger.warning(' Error is ' + str(e))
             if (tries>2):
                 try:
                     sysItems['Multiplexer']['device'].write8(int(0x00),int(0x00)) #Disconnect multiplexer. 
-                    print(str(datetime.now()) + 'Disconnected multiplexer on ' + str(M) + ', trying to connect again.')
+                    application.logger.warning('Disconnected multiplexer on ' + str(M) + ', trying to connect again')
                 except:
-                    print(str(datetime.now()) + 'Failed to recover multiplexer on device ' + str(M))
+                    application.logger.warning('Failed to recover multiplexer on device ' + str(M))
             if (tries==5 or tries==10 or tries==15):
                 toggleWatchdog()  #Flip the watchdog pin to ensure it is working.
                 GPIO.output('P8_15', GPIO.LOW) #Flip the Multiplexer RESET pin. Note this reset function works on Control Board V1.2 and later.
                 time.sleep(0.1)
                 GPIO.output('P8_15', GPIO.HIGH)
                 time.sleep(0.1)
-                print(str(datetime.now()) + 'Did multiplexer hard-reset on ' + str(M))
+                application.logger.warning('Did multiplexer hard-reset on ' + str(M))
                 
         if tries>20: #If it has failed a number of times then likely something is seriously wrong, so we crash the software.
             sysItems['Watchdog']['ON']=0 #Basically this will crash all the electronics and the software. 
             out=0
-            print(str(datetime.now()) + 'Failed to communicate to Multiplexer 20 times. Disabling hardware and software!')
+            application.logger.critical('Failed to communicate to Multiplexer 20 times. Disabling hardware and software!')
             tries=-1
             os._exit(4)
     
@@ -1425,10 +1546,10 @@ def I2CCom(M,device,rw,hl,data1,data2,SMBUSFLAG):
             tries=tries+1
             
             if (device!="ThermometerInternal"):
-                print(str(datetime.now()) + ' Failed ' + str(device) + ' comms ' + str(tries) + " times on device " + str(M) )
+                application.logger.warning(' Failed ' + str(device) + ' comms ' + str(tries) + " times on device " + str(M))
                 time.sleep(0.02)
             if (device=='AS7341'):
-                print(str(datetime.now()) + ' Failed  AS7341 in I2CCom while trying to send ' + str(data1)  + " and " + str(data2))
+                application.logger.warning(' Failed  AS7341 in I2CCom while trying to send ' + str(data1)  + " and " + str(data2))
                 out=-1
                 tries=-1
 
@@ -1440,7 +1561,7 @@ def I2CCom(M,device,rw,hl,data1,data2,SMBUSFLAG):
             sysItems['Watchdog']['ON']=0 #Basically this will crash all the electronics and the software. 
             out=0
             sysData[M]['present']=0
-            print(str(datetime.now()) + 'Failed to communicate to a device 10 times. Disabling hardware and software!')
+            application.logger.critical('Failed to communicate to a device 10 times. Disabling hardware and software!')
             tries=-1
             os._exit(4)
                 
@@ -1451,7 +1572,7 @@ def I2CCom(M,device,rw,hl,data1,data2,SMBUSFLAG):
     try:
         sysItems['Multiplexer']['device'].write8(int(0x00),int(0x00)) #Disconnect multiplexer with each iteration. 
     except:
-        print(str(datetime.now()) + 'Failed to disconnect multiplexer on device ' + str(M))
+        application.logger.warning('Failed to disconnect multiplexer on device ' + str(M))
 
 
     
@@ -1479,27 +1600,27 @@ def CalibrateOD(M,item,value,value2):
         b=sysData[M]['OD0']['LASERb'] 
         if (ODActual<0):
             ODActual=0
-            print(str(datetime.now()) + "You put a negative OD into calibration! Setting it to 0")
+            application.logger.warning("You put a negative OD into calibration! Setting it to 0")
         
         raw=((ODActual/a +  (b/(2*a))**2)**0.5) - (b/(2*a)) #THis is performing the inverse function of the quadratic OD calibration.
         OD0=(10.0**raw)*ODRaw
         if (OD0<sysData[M][item]['min']):
             OD0=sysData[M][item]['min']
-            print(str(datetime.now()) + 'OD calibration value seems too low?!')
+            application.logger.info('OD calibration value seems too low?!')
 
         if (OD0>sysData[M][item]['max']):
             OD0=sysData[M][item]['max']
-            print(str(datetime.now()) + 'OD calibration value seems too high?!')
+            application.logger.info('OD calibration value seems too high?!')
 
     
         sysData[M][item]['target']=OD0
-        print(str(datetime.now()) + "Calibrated OD")
+        application.logger.info("Calibrated OD")
     elif (device=='LEDF'):
         a=sysData[M]['OD0']['LEDFa']#Retrieve the calibration factors for OD.
         
         if (ODActual<0):
             ODActual=0
-            print("You put a negative OD into calibration! Setting it to 0")
+            application.logger.warning("You put a negative OD into calibration! Setting it to 0")
         if (M=='M0'):
             CF=1299.0
         elif (M=='M1'):
@@ -1509,26 +1630,26 @@ def CalibrateOD(M,item,value,value2):
         elif (M=='M3'):
             CF=1494.0
             
-        #raw=(ODActual)/a  #THis is performing the inverse function of the linear OD calibration.
-        #OD0=ODRaw - raw*CF
+        raw=(ODActual)/a  #THis is performing the inverse function of the linear OD calibration.
+        OD0=ODRaw - raw*CF
         OD0=ODRaw/ODActual
-        print(OD0)
+        application.logger.debug(str(OD0) + "\n")
     
         if (OD0<sysData[M][item]['min']):
             OD0=sysData[M][item]['min']
-            print('OD calibration value seems too low?!')
+            application.logger.info('OD calibration value seems too low?!')
         if (OD0>sysData[M][item]['max']):
             OD0=sysData[M][item]['max']
-            print('OD calibration value seems too high?!')
+            application.logger.info('OD calibration value seems too high?!')
     
         sysData[M][item]['target']=OD0
-        print("Calibrated OD")
+        application.logger.info("Calibrated OD\n")
     elif (device=='LEDA'):
         a=sysData[M]['OD0']['LEDAa']#Retrieve the calibration factors for OD.
         
         if (ODActual<0):
             ODActual=0
-            print("You put a negative OD into calibration! Setting it to 0")
+            application.logger.warning("You put a negative OD into calibration! Setting it to 0")
         if (M=='M0'):
             CF=422
         elif (M=='M1'):
@@ -1538,20 +1659,20 @@ def CalibrateOD(M,item,value,value2):
         elif (M=='M3'):
             CF=522
             
-        #raw=(ODActual)/a  #THis is performing the inverse function of the linear OD calibration.
-        #OD0=ODRaw - raw*CF
+        raw=(ODActual)/a  #THis is performing the inverse function of the linear OD calibration.
+        OD0=ODRaw - raw*CF
         OD0=ODRaw/ODActual
-        print(OD0)
+        application.logger.debug(str(OD0) + "\n")
     
         if (OD0<sysData[M][item]['min']):
             OD0=sysData[M][item]['min']
-            print('OD calibration value seems too low?!')
+            application.logger.info('OD calibration value seems too low?!')
         if (OD0>sysData[M][item]['max']):
             OD0=sysData[M][item]['max']
-            print('OD calibration value seems too high?!')
+            application.logger.info('OD calibration value seems too high?!')
     
         sysData[M][item]['target']=OD0
-        print("Calibrated OD")
+        application.logger.info("Calibrated OD\n")
         
     return ('', 204)    
     
@@ -1572,12 +1693,12 @@ def MeasureOD(M):
     
         a=sysData[M]['OD0']['LASERa']#Retrieve the calibration factors for OD.
         b=sysData[M]['OD0']['LASERb'] 
-        if abs(sysData[M]['OD0']['raw']) > 0.001: # avoid devision by 0
+        try:
             raw=math.log10(sysData[M]['OD0']['target']/sysData[M]['OD0']['raw'])
             sysData[M]['OD']['current']=raw*b + raw*raw*a
-        else:
-            sysData[M]['OD']['current']=0
-            print(str(datetime.now()) + ' OD Measurement close to 0 on ' + str(device))
+        except:
+            sysData[M]['OD']['current']=0;
+            application.logger.warning(' OD Measurement exception on ' + str(device))
     elif (device=='LEDF'):
         out=GetTransmission(M,'LEDF',['CLEAR'],7,255)
 
@@ -1592,12 +1713,12 @@ def MeasureOD(M):
                 CF=1660.0
             elif (M=='M3'):
                 CF=1494.0
-            #raw=out[0]/CF - sysData[M]['OD0']['target']/CF
+            raw=out[0]/CF - sysData[M]['OD0']['target']/CF
             raw=out[0]/sysData[M]['OD0']['target']
             sysData[M]['OD']['current']=raw
         except:
             sysData[M]['OD']['current']=0;
-            print(str(datetime.now()) + ' OD Measurement exception on ' + str(device))
+            application.logger.warning(' OD Measurement exception on ' + str(device))
 
     elif (device=='LEDA'):
         out=GetTransmission(M,'LEDA',['CLEAR'],7,255)
@@ -1613,13 +1734,13 @@ def MeasureOD(M):
                 CF=574.0
             elif (M=='M3'):
                 CF=522.0
-            #raw=out[0]/CF - sysData[M]['OD0']['target']/CF
+            raw=out[0]/CF - sysData[M]['OD0']['target']/CF
             raw=out[0]/sysData[M]['OD0']['target']
             #sysData[M]['OD']['current']=raw*a
             sysData[M]['OD']['current']=raw
         except:
             sysData[M]['OD']['current']=0;
-            print(str(datetime.now()) + ' OD Measurement exception on ' + str(device))
+            application.logger.warning(' OD Measurement exception on ' + str(device))
     
     return ('', 204)  
     
@@ -1716,10 +1837,10 @@ def setPWM(M,device,channels,fraction,ConsecutiveFails):
     
         if(CheckLow!=(int(LowVals,2)) or CheckHigh!=(int(HighVals,2)) or CheckHighON!=int(0x00) or CheckLowON!=int(0x00)): #We check to make sure it has been set to appropriate values.
             ConsecutiveFails=ConsecutiveFails+1
-            print(str(datetime.now()) + ' Failed transmission test on ' + str(device) + ' ' + str(ConsecutiveFails) + ' times consecutively on device '  + str(M) )
+            application.logger.warning(' Failed transmission test on ' + str(device) + ' ' + str(ConsecutiveFails) + ' times consecutively on device '  + str(M))
             if ConsecutiveFails>10:
                 sysItems['Watchdog']['ON']=0 #Basically this will crash all the electronics and the software. 
-                print(str(datetime.now()) + 'Failed to communicate to PWM 10 times. Disabling hardware and software!')
+                application.logger.critical('Failed to communicate to PWM 10 times. Disabling hardware and software!')
                 os._exit(4)
             else:
                 time.sleep(0.1)
@@ -1796,7 +1917,7 @@ def csvData(M):
                 writer = csv.writer(csvFile)
                 writer.writerow(fieldnames)
         else:
-            print('CSV_WRITER: mismatch between column num and header num')
+            application.logger.warning('CSV_WRITER: mismatch between column num and header num')
 
     with open(filename, 'a') as csvFile: # Here we append the new data to our CSV file.
         writer = csv.writer(csvFile)
@@ -1867,15 +1988,19 @@ def downsampleFunc(datain,index):
         
 
 
-
-def RegulateOD(M):
+# change made by Marco on 06.05.2025
+def RegulateOD(M, target=None):
     #Function responsible for turbidostat functionality (OD control)
     global sysData
     global sysItems
     M=str(M)
     
     if (sysData[M]['Zigzag']['ON']==1):
-        TargetOD=sysData[M]['OD']['target']
+        if target is not None:
+            TargetOD=target
+        else:
+            TargetOD=sysData[M]['OD']['target']
+        application.logger.info('RegulateOD: performing Zigzag with target: ' + str(TargetOD))
         Zigzag(M) #Function that calculates new target pump rates, and sets pumps to desired rates. 
 
     
@@ -1887,22 +2012,33 @@ def RegulateOD(M):
     
     
     ODNow=sysData[M]['OD']['current']
-    ODTarget=sysData[M]['OD']['target']
+    # change made by Marco on 06.05.2025
+    if target is not None:
+        ODTarget=target
+        #application.logger.info('RegulateOD: script-defined OD target: ' + str(ODTarget))
+    else:
+        ODTarget=sysData[M]['OD']['target']
+        #application.logger.info('RegulateOD: interface-defined OD target: ' + str(ODTarget))
     if (ODTarget<=0): #There could be an error on the log operationif ODTarget is 0!
         ODTarget=0.000001
         
     errorTerm=ODTarget-ODNow
     Volume=sysData[M]['Volume']['target']
     
+    #application.logger.info('RegulateOD: OD error term: ' + str(errorTerm))
+    #application.logger.info('RegulateOD: Volume: ' + str(Volume))
+
     PercentPerMin=4*60/Volume #Gain parameter to convert from pump rate to rate of OD reduction.
 
     if sysData[M]['Experiment']['cycles']<3:
         Pump1=0 #In first few cycles we do precisely no pumping.
+        application.logger.info('RegulateOD: Pump1 set to 0 in first few cycles (<3)')
     elif len(sysData[M]['time']['record']) < 2:
         Pump1=0 #In first few cycles we do precisely no pumping.
         addTerminal(M, "Warning: Tried to calculate time elapsed with fewer than two " +\
-    				"timepoints recorded. If you see this message a lot, there may be " +\
-    				"a more serious problem.")
+                               "timepoints recorded. If you see this message a lot, there may be " +\
+                               "a more serious problem.")
+        application.logger.info('RegulateOD: Pump1 set to 0 in first few cycles (<2)')
     else:
         ODPast=sysData[M]['OD']['record'][-1]
         timeElapsed=((sysData[M]['time']['record'][-1])-(sysData[M]['time']['record'][-2]))/60.0 #Amount of time betwix measurements in minutes
@@ -1913,7 +2049,8 @@ def RegulateOD(M):
                 NewGrowth=0.0
         else:
             NewGrowth=0.0
-            
+        #application.logger.info('RegulateOD: New growth rate: ' + str(NewGrowth))
+
         Pump1=-1.0*NewGrowth/PercentPerMin
         
         #Next Section is Integral Control
@@ -1925,6 +2062,7 @@ def RegulateOD(M):
         elif (abs(ODNow-ODPast)<0.05 and ODerror>0.025): #preventing massive accidental jumps causing trouble with this integral term.
             ODIntegral=ODIntegral+0.1*ODerror
         sysData[M]['OD']['Integral']=ODIntegral
+        #application.logger.info('RegulateOD: OD Integral term: ' + str(ODIntegral))
         # Integrator 2 
         ODIntegral2=sysData[M]['OD']['Integral2']
         if (abs(ODerror)>0.1 and abs(ODNow-ODPast)<0.05):
@@ -1933,11 +2071,13 @@ def RegulateOD(M):
             ODIntegral2=ODIntegral2+0.01*ODerror
             Pump1=Pump1*0.7 #This is essentially enforcing a smaller Proportional gain when we are near to OD setpoint.
         sysData[M]['OD']['Integral2']=ODIntegral2
-        
+        #application.logger.info('RegulateOD: OD Integral2 term: ' + str(ODIntegral2))
+
         Pump1=Pump1+ODIntegral+ODIntegral2
         
         if (ODNow-ODPast)>0.04: #This is to counteract noisy jumps in OD measurements from causing mayhem in the regulation algorithm.
             Pump1=0.0
+            #application.logger.info('RegulateOD: Pump1 set to 0 due to large jump in OD (' + str(ODNow-ODPast) + ')')
 
     #Make sure values are in appropriate range. We want to limit the maximum size of pump1 to prevent it from overflowing.
     if(Pump1>0.02):
@@ -1945,20 +2085,27 @@ def RegulateOD(M):
     elif(Pump1<0):
         Pump1=0.0
 
+    #application.logger.info('RegulateOD: Pump1 set to ' + str(Pump1))
+
     if(sysData[M]['Chemostat']['ON']==1):
         Pump1=float(sysData[M]['Chemostat']['p1'])
+        application.logger.info('RegulateOD: Chemostat mode active, Pump1 set to ' + str(Pump1))
 
     #Set new Pump targets
     sysData[M]['Pump1']['target']=Pump1*Pump1Direction
     sysData[M]['Pump2']['target']=(Pump1*4+0.07)*Pump2Direction
+    #application.logger.info('RegulateOD: Pump1 set to ' + str(sysData[M]['Pump1']['target']))
+    #application.logger.info('RegulateOD: Pump2 set to ' + str(sysData[M]['Pump2']['target']))
 
     if(sysData[M]['Experiment']['cycles']%5==1): #Every so often we do a big output pump to make sure tubes are clear.
         sysData[M]['Pump2']['target']=0.25*sysData[M]['Pump2']['direction']
+        #application.logger.info('RegulateOD: Pump2 set to ' + str(sysData[M]['Pump2']['target']) + ' due to pump clearing')
     
     
     
     
     if (sysData[M]['Experiment']['cycles']>15):
+        #application.logger.info('RegulateOD: >15 cycles')
         #This section is to check if we have added any liquid recently, if not, then we dont run pump 2 since it won't be needed.
         pastpumping=abs(sysData[M]['Pump1']['target'])
         for pv in range(-10,-1):
@@ -1975,10 +2122,11 @@ def RegulateOD(M):
 
         
     if (sysData[M]['Zigzag']['ON']==1): #If the zigzag growth estimation is running then we change OD setpoint appropriately.
+        application.logger.info('RegulateOD: Zigzag mode active (final check)')
         try:
             sysData[M]['OD']['target']=TargetOD
         except:
-            print('Somehow you managed to activate Zigzag at a sub-optimal time')
+            application.logger.warning('Somehow you managed to activate Zigzag at a sub-optimal time')
             #Do nothing
  
     return
@@ -2011,7 +2159,7 @@ def Zigzag(M):
     #Subsequent section is for growth estimation.
 	
     TimeSinceSwitch=iteration-sysData[M]['Zigzag']['SwitchPoint']
-    if (iteration>6 and TimeSinceSwitch>5 and current > 0 and last > 0 and sysData[M]['Zigzag']['target']==5.0): #The reason we wait a few minutes after starting growth is that new media may still be introduced, it takes a while for the growth to get going.
+    if (iteration>6 and TimeSinceSwitch>5 and current > 0 and last > 0): #The reason we wait a few minutes after starting growth is that new media may still be introduced, it takes a while for the growth to get going.
         dGrowthRate=(math.log(current)-math.log(last))*60.0 #Converting to units of 1/hour
         sysData[M]['GrowthRate']['current']=sysData[M]['GrowthRate']['current']*0.95 + dGrowthRate*0.05 #We are essentially implementing an online growth rate estimator with learning rate 0.05
 
@@ -2233,4 +2381,4 @@ if __name__ == '__main__':
     application.run(debug=True,threaded=True,host='0.0.0.0',port=5000)
     
 initialiseAll()
-print(str(datetime.now()) + ' Start Up Complete')
+application.logger.info(' Start Up Complete\n')
